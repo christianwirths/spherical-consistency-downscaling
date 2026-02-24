@@ -1,0 +1,938 @@
+# Spherical Graph Consistency Model for Climate Field Generation
+
+> A Detailed Technical Description of the Architecture, Design Rationale, and Training Procedure
+
+---
+
+## Table of Contents
+
+1. [Introduction and Motivation](#1-introduction-and-motivation)
+2. [Background: What Is a Consistency Model?](#2-background-what-is-a-consistency-model)
+3. [The Spherical Problem: Why Standard CNNs Fail on the Globe](#3-the-spherical-problem-why-standard-cnns-fail-on-the-globe)
+4. [Our Solution: DirectNeighConv on an Equiangular Grid](#4-our-solution-directneighconv-on-an-equiangular-grid)
+5. [The Spherical U-Net Architecture](#5-the-spherical-u-net-architecture)
+6. [Time Conditioning: Telling the Network "How Noisy Is This?"](#6-time-conditioning-telling-the-network-how-noisy-is-this)
+7. [Pooling and Upsampling: Moving Between Resolutions](#7-pooling-and-upsampling-moving-between-resolutions)
+8. [The Full Forward Pass: End-to-End](#8-the-full-forward-pass-end-to-end)
+9. [Training: The Consistency Objective](#9-training-the-consistency-objective)
+10. [Sampling: Generating New Climate Fields](#10-sampling-generating-new-climate-fields)
+11. [Design Decisions and Lessons Learned](#11-design-decisions-and-lessons-learned)
+12. [Summary of Hyperparameters](#12-summary-of-hyperparameters)
+
+---
+
+## 1. Introduction and Motivation
+
+Climate models produce global fields — temperature, precipitation, cloud cover — that live on the surface of a sphere. When we want to generate realistic climate fields using deep generative models, we face a fundamental tension:
+
+- **Standard 2D convolutional neural networks** treat images as flat rectangles. They have no knowledge that the left edge of a global map is the same physical location as the right edge (longitude wraps around), nor that the top and bottom edges represent single points (the poles).
+
+- **Graph neural networks** can respect arbitrary topology, but classical spectral approaches (like Chebyshev polynomial convolutions) use *isotropic* filters that cannot distinguish between directions — they see all neighbours as equivalent.
+
+Our model resolves this tension by introducing **DirectNeighConv**: a convolution operator that behaves exactly like a standard 3×3 Conv2d but with correct spherical boundary handling. Combined with a **consistency model** training objective (which enables single-step generation), the result is a generative model that produces physically consistent global climate fields in one forward pass.
+
+### What does the model do?
+
+```
+Input:  Pure Gaussian noise  z ~ N(0, σ²I)     shape: [B, 3, 176, 360]
+                                                       ↑  ↑   ↑    ↑
+                                                    batch ch  lat  lon
+                    ┌──────────────────────┐
+                    │  Spherical Graph     │
+              z ──→ │  Consistency Model   │ ──→ x̂   (realistic climate field)
+                    │  f_θ(z, t=σ_max)     │
+                    └──────────────────────┘
+
+Output: Realistic climate field x̂              shape: [B, 3, 176, 360]
+        Channel 0: precipitation (pr)
+        Channel 1: 2m temperature (t2m)
+        Channel 2: total cloud cover (tcc)
+```
+
+The three channels represent precipitation, near-surface temperature, and total cloud cover from ERA5 reanalysis data at 1° resolution — physically meaningful fields that must be spatially coherent and respect the Earth's spherical geometry.
+
+---
+
+## 2. Background: What Is a Consistency Model?
+
+### 2.1 The Problem with Traditional Diffusion Models
+
+Diffusion models (DDPM, score-based models) generate data by *gradually denoising* a noisy input over many steps. While the quality is excellent, this sequential process is slow — generating one sample may require 50–1000 forward passes through the network.
+
+### 2.2 The Consistency Model Idea
+
+A **consistency model** (Song et al., 2023) learns a function $f_\theta(x_t, t)$ that maps *any* noisy version of a data point directly back to the clean data, regardless of the noise level $t$:
+
+$$f_\theta(x_t, t) \approx x_0 \quad \text{for all } t \in [t_{\min}, t_{\max}]$$
+
+The key property — the **consistency property** — is that all points on the same noise trajectory map to the same clean output:
+
+$$f_\theta(x_{t_1}, t_1) = f_\theta(x_{t_2}, t_2) \quad \text{whenever } x_{t_1} \text{ and } x_{t_2} \text{ lie on the same trajectory}$$
+
+```
+    Noise level (t)
+    ↑
+    │
+t_max ─ ─ ─ ─ ─●─ ─ ─ ─ ─ ─ ─ ─ ─ ─●─ ─ ─     Pure noise
+    │          ╱                      ╱
+    │         ╱  Trajectory 1        ╱  Trajectory 2
+    │        ╱                      ╱
+    │       ●                      ●
+    │      ╱                      ╱
+    │     ╱                      ╱
+t_min ── ●──────────────────────●────────────     ≈ Clean data
+    │    x₀⁽¹⁾                 x₀⁽²⁾
+    └────────────────────────────────────────→  Data space
+    
+    The consistency model maps every ● on the same trajectory
+    to the SAME point on the t_min line (≈ clean data).
+```
+
+### 2.3 Why This Is Powerful
+
+- **Single-step generation**: Sample noise $z \sim \mathcal{N}(0, \sigma_{\max}^2 I)$, run the model once: $\hat{x} = f_\theta(z, t_{\max})$. Done.
+- **Optional multi-step refinement**: For higher quality, you can iterate: denoise → add a little noise back → denoise again. But even 1–3 steps often suffice.
+- **Same architecture**: The neural network backbone is a standard U-Net — only the training objective changes.
+
+### 2.4 The Skip Connection Parameterization
+
+The raw network output is not used directly. Instead, the model uses a parameterization that guarantees the boundary condition $f_\theta(x, t_{\min}) = x$ (at minimal noise, return the input unchanged):
+
+$$f_\theta(x_t, t) = c_{\text{skip}}(t) \cdot x_t + c_{\text{out}}(t) \cdot F_\theta(x_t, t)$$
+
+where $F_\theta$ is the raw network output and:
+
+$$c_{\text{skip}}(t) = \frac{\sigma_{\text{data}}^2}{(t - t_{\min})^2 + \sigma_{\text{data}}^2}, \qquad c_{\text{out}}(t) = \frac{\sigma_{\text{data}} \cdot t}{\sqrt{t^2 + \sigma_{\text{data}}^2}}$$
+
+**Why these specific coefficients?**
+
+| At $t = t_{\min}$ (nearly clean) | At $t = t_{\max}$ (pure noise) |
+|---|---|
+| $c_{\text{skip}} \approx 1$, $c_{\text{out}} \approx 0$ | $c_{\text{skip}} \approx 0$, $c_{\text{out}} \approx 1$ |
+| Output ≈ input (identity) | Output ≈ pure network prediction |
+
+This ensures the consistency boundary condition is satisfied automatically without the network having to learn it, and smoothly transitions from "trust the input" to "trust the network" as noise increases.
+
+---
+
+## 3. The Spherical Problem: Why Standard CNNs Fail on the Globe
+
+### 3.1 The Earth Is Not a Rectangle
+
+When we represent a global field as a 2D array of shape $[H_{\text{lat}}, W_{\text{lon}}]$, we introduce artificial boundaries:
+
+```
+Standard 2D image representation:
+
+    ┌─────────────────────────────────────────┐
+    │  ← North Pole (top edge — artificial)   │
+    │                                         │
+    │  Left         Global Climate          Right
+    │  edge         Field (lat×lon)          edge
+    │  (180°W)                              (180°E)
+    │                                         │
+    │  ← South Pole (bottom edge — artificial)│
+    └─────────────────────────────────────────┘
+    
+    Problems:
+    ✗ Left & right edges are the SAME physical location → discontinuity
+    ✗ Top row has 360 pixels but represents a SINGLE point (North Pole)
+    ✗ Bottom row: same problem (South Pole)
+    ✗ Standard Conv2d: zero-padding at all 4 edges → artefacts
+```
+
+A standard 3×3 Conv2d with zero-padding creates artefacts at all four edges:
+- **East-West boundary**: The convolution sees zeros where it should see the data from the opposite side of the map.
+- **Poles**: The convolution sees zeros where it should see data from the other side of the pole.
+
+### 3.2 Why Not Just Use Circular Padding?
+
+Circular padding in the longitude direction (left-right) is straightforward and solves the East-West problem. But the poles are fundamentally different — they are **singular points** where all longitudes converge. Standard 2D padding modes cannot represent this topology.
+
+### 3.3 Previous Approach: Chebyshev Spectral Graph Convolution
+
+The DeepSphere framework (Defferrard et al., 2020) represents the globe as a graph and uses Chebyshev polynomial graph convolutions. A Chebyshev filter of order $K$ computes:
+
+$$y = \sum_{k=0}^{K-1} w_k \cdot T_k(\tilde{L}) \cdot x$$
+
+where $\tilde{L}$ is the rescaled graph Laplacian and $T_k$ are Chebyshev polynomials.
+
+**The problem**: These filters are **isotropic** — they can only distinguish between "how far away" a neighbour is (via spectral distance), not *which direction* it lies in. With $K = 3$:
+
+- $T_0(\tilde{L}) = I$ (identity — just the vertex itself)
+- $T_1(\tilde{L}) = \tilde{L}$ (weighted average of 1-hop neighbours)
+- $T_2(\tilde{L}) = 2\tilde{L}^2 - I$ (2-hop neighbourhood)
+
+This gives only **3 scalar weights** for the entire filter, versus **9 independent weights** in a standard 3×3 Conv2d. Critically, $T_0 = I$ means the network has a trivial shortcut that passes the input through unchanged — any blocky artefacts from upsampling simply propagate through the Chebyshev filter unmodified.
+
+```
+Chebyshev (K=3): isotropic           DirectNeighConv: anisotropic
+
+      ○  ○  ○                              w₈  w₁  w₂
+      ○  ●  ○  ← all weighted             w₇  w₀  w₃
+      ○  ○  ○    by SAME w₁               w₆  w₅  w₄
+
+  Only 3 learnable weights:             9 learnable weights:
+  w₀ (self), w₁ (1-hop), w₂ (2-hop)   One per spatial direction
+  
+  Cannot detect edges in any            Full directional selectivity
+  specific direction.                   (exactly like Conv2d)
+```
+
+---
+
+## 4. Our Solution: DirectNeighConv on an Equiangular Grid
+
+### 4.1 Core Idea
+
+We replace the spectral Chebyshev convolution with a **direct spatial gather** operation. For each grid cell, we explicitly identify its 8 spatial neighbours, gather their features, concatenate them, and apply a learned linear transformation:
+
+$$\text{DirectNeighConv}(x)_v = W \cdot \text{concat}(x_{v}, x_{N}, x_{NE}, x_{E}, x_{SE}, x_{S}, x_{SW}, x_{W}, x_{NW}) + b$$
+
+where $W \in \mathbb{R}^{F_{\text{out}} \times 9F_{\text{in}}}$ and the indices $\{v, N, NE, E, SE, S, SW, W, NW\}$ are precomputed once for the entire grid.
+
+This is mathematically equivalent to a 3×3 Conv2d — the same number of parameters, the same receptive field — but with **correct spherical boundary handling** built into the neighbour indices rather than the padding mode.
+
+### 4.2 Neighbour Index Construction
+
+For an equiangular grid of shape $H \times W$ (latitude × longitude), every cell $(i, j)$ has 8 neighbours. The indices are precomputed into a table $\text{neigh} \in \mathbb{Z}^{HW \times 9}$:
+
+```
+Canonical neighbour ordering (compass directions):
+
+         NW(8)   N(1)   NE(2)           Flat index mapping:
+           ╲      │      ╱              v = i × W + j
+            ╲     │     ╱               
+     W(7) ── self(0) ── E(3)            Example: H=4, W=8, cell (1,3):
+            ╱     │     ╲               v = 1×8 + 3 = 11
+           ╱      │      ╲             
+         SW(6)   S(5)   SE(4)           neigh[11] = [11, 3, 4, 12, 20, 19, 18, 10, 2]
+                                                     self N  NE  E   SE  S   SW  W   NW
+```
+
+#### Interior Points (Straightforward)
+
+For any cell not on the edge of the grid array:
+```
+N  = (i-1) × W + j
+NE = (i-1) × W + (j+1)
+E  =  i    × W + (j+1)
+SE = (i+1) × W + (j+1)
+S  = (i+1) × W + j
+SW = (i+1) × W + (j-1)
+W  =  i    × W + (j-1)
+NW = (i-1) × W + (j-1)
+```
+
+#### Longitude Wrapping (East-West Boundary)
+
+The Earth's surface wraps around in longitude. Column $j = 0$ (180°W) and column $j = W-1$ (180°E) are physically adjacent:
+
+$$j_{\text{east}} = (j + 1) \bmod W, \qquad j_{\text{west}} = (j - 1) \bmod W$$
+
+```
+Longitude wrapping example (W=8):
+
+    j: 0  1  2  3  4  5  6  7  │  0  1  2  ...
+       ●──●──●──●──●──●──●──●──┤──●──●──●
+       ↑                     ↑  │  ↑
+       │                     └──┼──┘
+       │         These are the SAME cell
+       │
+       For cell (i, 0):  West neighbour = cell (i, W-1) = cell (i, 7)
+       For cell (i, 7):  East neighbour = cell (i, 0)
+```
+
+This is identical to circular padding in standard Conv2d — but here it's built into the index array rather than relying on the padding mode.
+
+#### Pole Reflection (North-South Boundary)
+
+The poles require special treatment because they are **singular points** — the entire top row ($i = 0$) represents a circle of points near the North Pole, and moving "north" from any of them crosses the pole and appears on the other side of the globe, shifted by 180° in longitude:
+
+$$i_{\text{reflected}} = i, \qquad j_{\text{reflected}} = \left(j + \frac{W}{2}\right) \bmod W$$
+
+```
+Pole reflection for the North Pole (i=0):
+
+    Longitude:  0°   90°E  180°  90°W       The Earth from above:
+    Column j:   0     2     4     6
+                                                 N
+    Row 0:      A  B  C  D  E  F  G  H          │
+                                              W──●──E
+    "North" of A (j=0) = E (j=4)                 │
+    because crossing the pole at 0° longitude    S
+    puts you at 180° longitude
+    
+    Detail:  Point A is at (row 0, lon=0°)
+             Going "north" crosses the pole
+             You emerge at (row 0, lon=180°) = point E
+             
+             Also: East and West reverse!
+             NE of A → NW of the reflected point
+             NW of A → NE of the reflected point
+```
+
+**Why do East and West reverse at the pole?** Imagine standing at the North Pole facing south along the 0° meridian. East is to your left (90°E). Now walk across the pole and face south along the 180° meridian. East is now to your *right* from the original perspective. The E/W sense has reversed.
+
+```
+The E/W reversal at the pole:
+
+    Standing at A, facing south:        After crossing pole to E:
+    
+         NW  N  NE                           NW  N  NE
+          ↖  ↑  ↗                             ↖  ↑  ↗
+     W ←  A      → E                    W ←  E      → E
+          ↙  ↓  ↘                             ↙  ↓  ↘
+         SW  S  SE                           SW  S  SE
+    
+    "NE" as seen from A looking north becomes "NW" 
+    when we flip to the other side of the pole.
+    
+    Implementation: 
+      NE_of_A = (j_refl - 1) % W   (shifted left = NW in reflected frame)
+      NW_of_A = (j_refl + 1) % W   (shifted right = NE in reflected frame)
+```
+
+### 4.3 Multi-Resolution Neighbour Arrays
+
+The U-Net operates at multiple spatial resolutions. Each pooling step halves both dimensions via 2×2 average pooling ($176 \times 360 \to 88 \times 180 \to 44 \times 90 \to 22 \times 45$). We precompute a separate neighbour-index array for each resolution:
+
+```
+Resolution pyramid:
+
+    Level 0 (finest):   176 × 360 = 63,360 vertices   neigh: [63360, 9]
+           │  2×2 avg pool
+    Level 1:             88 × 180 = 15,840 vertices   neigh: [15840, 9]
+           │  2×2 avg pool
+    Level 2:             44 ×  90 =  3,960 vertices   neigh: [ 3960, 9]
+           │  2×2 avg pool
+    Level 3 (coarsest):  22 ×  45 =    990 vertices   neigh: [  990, 9]
+```
+
+All neighbour arrays are computed once at initialization and stored as PyTorch **buffers** (non-trainable tensors that automatically move to the correct device with the model).
+
+### 4.4 How DirectNeighConv Operates
+
+```python
+class DirectNeighConv(nn.Module):
+    """Analogous to 3×3 Conv2d but with spherical topology."""
+    
+    def __init__(self, in_ch, out_ch):
+        self.weight = nn.Linear(9 * in_ch, out_ch)
+    
+    def forward(self, neigh_orders, x):
+        # x: [B, V, F_in]           (B=batch, V=vertices, F_in=features)
+        # neigh_orders: [V, 9]      (precomputed)
+        
+        # Step 1: Gather 9 neighbours for each vertex
+        mat = x[:, neigh_orders]     # [B, V, 9, F_in]
+        
+        # Step 2: Flatten the spatial neighbourhood
+        mat = mat.reshape(B, V, 9 * F_in)  # [B, V, 9·F_in]
+        
+        # Step 3: Learned linear transform (= the convolution weights)
+        return self.weight(mat)      # [B, V, F_out]
+```
+
+**Parameter count comparison** for a single layer with $F_{\text{in}} = F_{\text{out}} = 128$:
+
+| Method | Parameters | Directional? |
+|---|---|---|
+| 3×3 Conv2d | $9 \times 128 \times 128 = 147,456$ | ✓ (9 independent directions) |
+| **DirectNeighConv** | $9 \times 128 \times 128 = 147,456$ | **✓ (9 independent directions)** |
+| ChebConv (K=3) | $3 \times 128 \times 128 = 49,152$ | ✗ (3 isotropic spectra) |
+
+DirectNeighConv has the same parameter count and expressiveness as Conv2d, but with correct spherical topology.
+
+---
+
+## 5. The Spherical U-Net Architecture
+
+### 5.1 Overview
+
+The architecture follows the classic encoder-decoder U-Net structure with skip connections, matching the design used in diffusion models (specifically, the `diffusers` library's `UNet2DModel`). The key difference is that all spatial convolutions are replaced by `DirectNeighConv` operating on graph signals.
+
+```
+Full Architecture (depth=4, channels=[128, 128, 256, 256]):
+
+  Input: [B, 3, 176, 360]
+    │
+    ▼ reshape to [B, 63360, 3]              ← grid-to-graph
+    │
+    ▼ ┌───────────────────────────────────────────────────────────┐
+    │ │ ENCODER                                                   │
+    │ │                                                           │
+    │ │ Level 0 (176×360, 63360 vertices):                        │
+    │ │   ResBlock(3→128) → ResBlock(128→128) ──────────────┐     │
+    │ │     │                                          skip  │     │
+    │ │     ▼ AvgPool2d (2×2)                                │     │
+    │ │ Level 1 (88×180, 15840 vertices):                    │     │
+    │ │   ResBlock(128→128) → ResBlock(128→128) ────────┐    │     │
+    │ │     │                                      skip  │    │     │
+    │ │     ▼ AvgPool2d (2×2)                            │    │     │
+    │ │ Level 2 (44×90, 3960 vertices):                  │    │     │
+    │ │   ResBlock(128→256) → ResBlock(256→256) ────┐    │    │     │
+    │ │     │                                  skip  │    │    │     │
+    │ │     ▼ AvgPool2d (2×2)                        │    │    │     │
+    │ │ Level 3 (22×45, 990 vertices):               │    │    │     │
+    │ │   ResBlock(256→256) → ResBlock(256→256) ─┐   │    │    │     │
+    │ └──────────────────────────────────────────┼───┼────┼────┼────┘
+    │                                            │   │    │    │
+    │ ┌──────────────────────────────────────────┼───┼────┼────┼────┐
+    │ │ MID-BLOCK (22×45, 990 vertices)          │   │    │    │    │
+    │ │   ResBlock(256→256)                      │   │    │    │    │
+    │ │      │                                   │   │    │    │    │
+    │ │   Self-Attention (full, 990 tokens)      │   │    │    │    │
+    │ │      │                                   │   │    │    │    │
+    │ │   ResBlock(256→256)                      │   │    │    │    │
+    │ └──────────────────────────────────────────┼───┼────┼────┼────┘
+    │                                            │   │    │    │
+    │ ┌──────────────────────────────────────────┼───┼────┼────┼────┐
+    │ │ DECODER                                  │   │    │    │    │
+    │ │                                          │   │    │    │    │
+    │ │ Level 3→2: Bilinear ×2 → Conv2d smooth   │   │    │    │    │
+    │ │   cat(↑, skip₂) → ResBlock(512→256)──────┘   │    │    │    │
+    │ │                  → ResBlock(256→256)           │    │    │    │
+    │ │     │                                         │    │    │    │
+    │ │ Level 2→1: Bilinear ×2 → Conv2d smooth        │    │    │    │
+    │ │   cat(↑, skip₁) → ResBlock(384→128)───────────┘    │    │    │
+    │ │                  → ResBlock(128→128)                │    │    │
+    │ │     │                                              │    │    │
+    │ │ Level 1→0: Bilinear ×2 → Conv2d smooth             │    │    │
+    │ │   cat(↑, skip₀) → ResBlock(256→128)────────────────┘    │    │
+    │ │                  → ResBlock(128→128)                     │    │
+    │ │     │                                                   │    │
+    │ │   GroupNorm → SiLU → DirectNeighConv(128→3)             │    │
+    │ └─────────────────────────────────────────────────────────┘    │
+    │                                                                │
+    ▼ reshape to [B, 3, 176, 360]              ← graph-to-grid      │
+    │                                                                │
+  Output: [B, 3, 176, 360]                                          │
+```
+
+**Total parameters: 14,485,193**
+
+### 5.2 The GraphResNetBlock (Core Building Block)
+
+Every convolution in the network lives inside a **GraphResNetBlock**. This is the fundamental building block — the network contains 18 of them (2 per encoder level × 4 levels + 2 in the mid-block + 2 per decoder level × 3 levels).
+
+```
+GraphResNetBlock(in_ch, out_ch):
+
+    Input x: [B, V, in_ch]          time embedding t_emb: [B, D_time]
+      │                                    │
+      │ ┌──────────────────────────────────┤
+      │ │                                  │
+      ▼ ▼                                  ▼
+    GroupNorm → SiLU → DirectNeighConv   SiLU → Linear(D_time → out_ch)
+      │         (in_ch → out_ch)           │
+      │                                    │
+      ▼◄──────────────────────────────────add   (additive time injection)
+      │
+    GroupNorm → SiLU → DirectNeighConv
+      │         (out_ch → out_ch)
+      │
+      ▼◄──────────────────────────────────add   (residual connection)
+      │                                    ↑
+      │                              Linear(in_ch → out_ch)
+      │                              (only if in_ch ≠ out_ch,
+    Output: [B, V, out_ch]           otherwise Identity)
+```
+
+**Design rationale for each component:**
+
+| Component | Purpose | Why this choice? |
+|---|---|---|
+| **GroupNorm** | Normalize features | Unlike BatchNorm, GroupNorm behaves identically in train and eval mode. This is critical for consistency models where the EMA teacher model runs in eval mode but must produce predictions consistent with the student. |
+| **SiLU** (Swish) | Non-linearity | $\text{SiLU}(x) = x \cdot \sigma(x)$. Smooth, non-monotonic activation that has become standard in modern diffusion model U-Nets. Slightly outperforms ReLU/GELU empirically. |
+| **Pre-norm** | GN before conv | Places normalization *before* each convolution (not after), following the "pre-activation ResNet" pattern. This stabilizes training for deep networks and is the standard in diffusion models. |
+| **Additive time injection** | Condition on noise level | The time embedding is projected to `out_ch` dimensions and *added* to the hidden state between the two convolutions. This is the default mode in diffusers (as opposed to scale+shift FiLM). Addition is sufficient because the model only needs to modulate its behaviour based on noise level, not perform complex feature-wise transformations. |
+| **Residual connection** | Gradient flow | Skip connection from input to output. If `in_ch ≠ out_ch`, a 1×1 linear projection adapts dimensions. This ensures gradients can flow through the entire network without vanishing. |
+
+### 5.3 The Mid-Block: Global Context via Self-Attention
+
+At the coarsest resolution ($22 \times 45 = 990$ vertices), the network applies full self-attention. This is computationally feasible because the sequence length is small:
+
+```
+Mid-Block (at 22×45 = 990 vertices):
+
+    Input: [B, 990, 256]
+      │
+    GraphResNetBlock(256 → 256)      ← local spatial processing
+      │
+    GraphSelfAttention(256)          ← global context mixing
+      │  ┌─────────────────────────────────────────────┐
+      │  │ GroupNorm                                    │
+      │  │ Q = Linear(x), K = Linear(x), V = Linear(x)│
+      │  │ Attention = softmax(Q·Kᵀ / √d) · V         │
+      │  │ Output = Linear(Attention) + x  (residual)  │
+      │  └─────────────────────────────────────────────┘
+      │
+    GraphResNetBlock(256 → 256)      ← local spatial processing
+      │
+    Output: [B, 990, 256]
+```
+
+**Why self-attention at the bottleneck?** 
+
+At $22 \times 45$ resolution, each cell covers roughly $8° \times 8°$ — about 900 km. Local convolutions at this resolution already have a large effective receptive field, but self-attention allows the model to capture truly global dependencies in a single layer. For example, the model can learn that a warm anomaly in the tropical Pacific (El Niño) affects precipitation patterns over the entire globe.
+
+The cost is $\mathcal{O}(V^2) = \mathcal{O}(990^2) \approx 10^6$ — negligible compared to the convolutions at higher resolutions.
+
+### 5.4 Encoder Details
+
+The encoder processes the input from finest to coarsest resolution. Each level applies two ResNet blocks, then downsamples via 2×2 average pooling:
+
+| Level | Resolution | Vertices | Channels | Operation |
+|---|---|---|---|---|
+| 0 | 176 × 360 | 63,360 | 3 → 128 → 128 | 2× ResBlock |
+| Pool | | | | 2×2 AvgPool |
+| 1 | 88 × 180 | 15,840 | 128 → 128 → 128 | 2× ResBlock |
+| Pool | | | | 2×2 AvgPool |
+| 2 | 44 × 90 | 3,960 | 128 → 256 → 256 | 2× ResBlock |
+| Pool | | | | 2×2 AvgPool |
+| 3 | 22 × 45 | 990 | 256 → 256 → 256 | 2× ResBlock |
+
+Skip connections save the output of each encoder level for the decoder.
+
+### 5.5 Decoder Details
+
+The decoder mirrors the encoder but in reverse, with skip connections from the encoder:
+
+| Level | Operation | Details |
+|---|---|---|
+| 3→2 | Bilinear upsample 2× | $22 \times 45 \to 44 \times 90$ |
+| | UpsampleConv2d | 3×3 Conv2d + GroupNorm + SiLU (smooth artefacts) |
+| | Concatenate skip₂ | $[256 + 256 = 512]$ channels |
+| | 2× ResBlock | $512 \to 256 \to 256$ |
+| 2→1 | Bilinear upsample 2× | $44 \times 90 \to 88 \times 180$ |
+| | UpsampleConv2d | 3×3 Conv2d + GroupNorm + SiLU |
+| | Concatenate skip₁ | $[256 + 128 = 384]$ channels |
+| | 2× ResBlock | $384 \to 128 \to 128$ |
+| 1→0 | Bilinear upsample 2× | $88 \times 180 \to 176 \times 360$ |
+| | UpsampleConv2d | 3×3 Conv2d + GroupNorm + SiLU |
+| | Concatenate skip₀ | $[128 + 128 = 256]$ channels |
+| | 2× ResBlock | $256 \to 128 \to 128$ |
+| Final | GroupNorm → SiLU → DirectNeighConv | $128 \to 3$ (output channels) |
+
+---
+
+## 6. Time Conditioning: Telling the Network "How Noisy Is This?"
+
+The consistency model must know *how noisy* the input is to predict the right denoising behaviour. This is communicated through a **time embedding** that is injected into every ResNet block.
+
+### 6.1 Sinusoidal Embedding
+
+The scalar noise level $t$ is first converted to a high-dimensional vector using sinusoidal positional encoding (borrowed from the Transformer):
+
+$$\text{emb}(t)_{2i} = \sin\left(\frac{t}{10000^{2i/d}}\right), \qquad \text{emb}(t)_{2i+1} = \cos\left(\frac{t}{10000^{2i/d}}\right)$$
+
+where $d = 64$ is the embedding dimension. This creates a unique, smoothly-varying representation for each noise level.
+
+### 6.2 Time MLP
+
+The raw sinusoidal embedding is refined through a small MLP:
+
+```
+    t (scalar)
+    │
+    ▼
+  Sinusoidal Embedding          → [B, 64]
+    │
+  Linear(64 → 256) → SiLU      → [B, 256]
+    │
+  Linear(256 → 64)              → [B, 64]
+    │
+    ▼
+  t_emb: [B, 64]               (used by all 18 ResNet blocks)
+```
+
+**Why an MLP after the sinusoidal embedding?** The sinusoidal encoding provides a fixed representation. The MLP learns to transform this into the particular representation that is most useful for the network's denoising task — for example, learning to represent the transition from "nearly clean" to "pure noise" in a way that aligns with the model's internal feature dynamics.
+
+### 6.3 Injection into ResNet Blocks
+
+Inside each `GraphResNetBlock`, the time embedding is:
+1. Passed through SiLU activation
+2. Linearly projected to match the block's channel dimension
+3. Added to the hidden features (broadcast across all vertices)
+
+```python
+# Inside GraphResNetBlock.forward():
+t = F.silu(t_emb)                    # [B, 64]
+t = self.time_emb_proj(t)            # [B, out_ch]  (e.g., [B, 128] or [B, 256])
+t = t.unsqueeze(1)                   # [B, 1, out_ch]
+h = h + t                            # [B, V, out_ch]  (broadcast across vertices)
+```
+
+This means every vertex receives the same time signal — the network learns to modulate its spatial processing based on the noise level uniformly across the globe.
+
+---
+
+## 7. Pooling and Upsampling: Moving Between Resolutions
+
+### 7.1 Downsampling: AvgPool2dGraph
+
+Downsampling converts the graph signal back to a 2D grid temporarily, applies standard 2×2 average pooling, and flattens back:
+
+```
+[B, V, C] → reshape → [B, H, W, C] → permute → [B, C, H, W]
+                                                       │
+                                                  F.avg_pool2d(kernel=2)
+                                                       │
+[B, V/4, C] ← reshape ← [B, H/2, W/2, C] ← permute ← [B, C, H/2, W/2]
+```
+
+**Why this works on an equiangular grid**: The vertices are ordered row-major (latitude × longitude), so reshaping to `[B, H, W, C]` produces a regular 2D grid where adjacent pixels are spatial neighbours. Standard 2×2 pooling then correctly averages four adjacent grid cells.
+
+**Note**: This introduces a mild distortion because equiangular grid cells are not equal-area — cells near the poles cover less physical area than cells near the equator. However, for generating climate fields at 1° resolution, this distortion is acceptable and vastly simpler than equal-area alternatives (like HEALPix).
+
+### 7.2 Upsampling: Bilinear Interpolation + Conv2d Smoothing
+
+Upsampling is the reverse of pooling but requires more care to avoid artefacts:
+
+```
+Step 1: Bilinear interpolation (AvgUnpool2dGraph)
+──────────────────────────────────────────────────
+[B, V, C] → reshape → [B, C, H, W] → F.interpolate(scale=2, mode="bilinear") 
+         → [B, C, 2H, 2W] → reshape → [B, 4V, C]
+
+Step 2: Conv2d smoothing (UpsampleConv2d)
+──────────────────────────────────────────
+[B, 4V, C] → reshape → [B, C, 2H, 2W] → Conv2d(3×3, circular padding)
+           → GroupNorm → SiLU → reshape → [B, 4V, C]
+```
+
+**Why bilinear instead of nearest-neighbour?** Nearest-neighbour upsampling creates visible 2×2 block artefacts where four pixels share the same value. A downstream isotropic convolution (like ChebConv) cannot smooth these because its $T_0 = I$ term preserves the blocky pattern unchanged. Bilinear interpolation produces smooth gradients between pixels from the start.
+
+**Why an additional Conv2d after bilinear?** Bilinear interpolation is a fixed (non-learned) operation. The subsequent 3×3 Conv2d with circular padding allows the network to learn residual corrections to the upsampled features. The `circular` padding mode ensures correct East-West boundary handling in the image domain. Note: the poles are not specially handled by this Conv2d — that correction happens in the subsequent DirectNeighConv blocks.
+
+---
+
+## 8. The Full Forward Pass: End-to-End
+
+Here is the complete data flow when the model processes a noisy input:
+
+```
+1. INPUT
+   ─────
+   Noisy climate field: [B, 3, 176, 360]    (3 channels: pr, t2m, tcc)
+   Noise level:         [B]                   (scalar per sample)
+
+2. GRID → GRAPH
+   ─────────────
+   x = images.permute(0,2,3,1).reshape(B, 63360, 3)    → [B, V, C]
+   
+   The 2D image is "unrolled" into a list of V=63,360 vertices,
+   each carrying C=3 features. The spherical topology is encoded
+   in the precomputed neighbour indices, not in the data layout.
+
+3. TIME EMBEDDING
+   ──────────────
+   t_emb = SinusoidalEmb(t)              → [B, 64]
+   t_emb = Linear(64→256) → SiLU        → [B, 256]
+   t_emb = Linear(256→64)               → [B, 64]
+   
+   This single embedding vector is shared by all 18 ResNet blocks.
+
+4. ENCODER (finest → coarsest)
+   ────────────────────────────
+   Level 0: [B, 63360, 3]  → 2× ResBlock → [B, 63360, 128]  → save skip₀
+   Pool:    [B, 63360, 128] → AvgPool2d  → [B, 15840, 128]
+   Level 1: [B, 15840, 128] → 2× ResBlock → [B, 15840, 128] → save skip₁
+   Pool:    [B, 15840, 128] → AvgPool2d  → [B, 3960, 128]
+   Level 2: [B, 3960, 128]  → 2× ResBlock → [B, 3960, 256]  → save skip₂
+   Pool:    [B, 3960, 256]  → AvgPool2d  → [B, 990, 256]
+   Level 3: [B, 990, 256]   → 2× ResBlock → [B, 990, 256]   → to mid-block
+
+5. MID-BLOCK (coarsest resolution)
+   ────────────────────────────────
+   [B, 990, 256] → ResBlock → SelfAttention → ResBlock → [B, 990, 256]
+   
+   Full self-attention over 990 tokens — captures global spatial patterns.
+
+6. DECODER (coarsest → finest)
+   ────────────────────────────
+   Upsample:  [B, 990, 256]   → Bilinear 2× → Conv2d smooth → [B, 3960, 256]
+   Concat:    cat(↑, skip₂)                                 → [B, 3960, 512]
+   Level 2:   [B, 3960, 512]  → 2× ResBlock                 → [B, 3960, 256]
+   
+   Upsample:  [B, 3960, 256]  → Bilinear 2× → Conv2d smooth → [B, 15840, 256]
+   Concat:    cat(↑, skip₁)                                 → [B, 15840, 384]
+   Level 1:   [B, 15840, 384] → 2× ResBlock                 → [B, 15840, 128]
+   
+   Upsample:  [B, 15840, 128] → Bilinear 2× → Conv2d smooth → [B, 63360, 128]
+   Concat:    cat(↑, skip₀)                                 → [B, 63360, 256]
+   Level 0:   [B, 63360, 256] → 2× ResBlock                 → [B, 63360, 128]
+
+7. FINAL PROJECTION
+   ─────────────────
+   [B, 63360, 128] → GroupNorm → SiLU → DirectNeighConv(128→3) → [B, 63360, 3]
+
+8. GRAPH → GRID
+   ─────────────
+   x = x.reshape(B, 176, 360, 3).permute(0,3,1,2)    → [B, 3, 176, 360]
+
+9. CONSISTENCY PARAMETERIZATION
+   ─────────────────────────────
+   output = c_skip(t) · input + c_out(t) · network_output
+   output = clamp(output, -1, 1)       ← ensures bounded output
+   
+   → Final output: [B, 3, 176, 360]
+```
+
+---
+
+## 9. Training: The Consistency Objective
+
+### 9.1 Training Procedure Overview
+
+The model is trained using **consistency distillation** with a teacher-student setup, where both the teacher and student share the same architecture but the teacher uses an exponential moving average (EMA) of the student's weights.
+
+```
+Training step:
+
+    Clean image x₀                 Noise ε ~ N(0, I)
+         │                              │
+         ├──── + tₙ · ε ──────────────→ x_tₙ   (less noisy)
+         │                              │
+         └──── + tₙ₊₁ · ε ───────────→ x_tₙ₊₁ (more noisy)
+                                        │
+                    ┌───────────────────┤
+                    │                   │
+                    ▼                   ▼
+              ┌──────────┐       ┌──────────┐
+              │ EMA model│       │  Student  │
+              │ (teacher)│       │  model    │
+              └────┬─────┘       └────┬─────┘
+                   │                   │
+                   ▼                   ▼
+                ŷ_teacher           ŷ_student
+                   │                   │
+                   └───────┬───────────┘
+                           │
+                     Loss(ŷ_student, ŷ_teacher)
+                           │
+                     Backprop through student only
+                     EMA update teacher weights
+```
+
+The key idea: the teacher (EMA model) processes a *less noisy* version of the same image, while the student processes a *more noisy* version. They should produce the same output (the consistency property). The teacher's predictions are treated as fixed targets (no gradient).
+
+### 9.2 Time Step Scheduling
+
+The training uses a curriculum that gradually increases the number of discrete time bins:
+
+$$N(k) = \left\lceil\sqrt{\frac{k}{K}(N_{\max}^2 - N_{\min}^2) + N_{\min}^2}\right\rceil$$
+
+where $k$ is the current training step, $K$ is the total number of steps, $N_{\min} = 2$, and $N_{\max} = 150$.
+
+**Why this schedule?** Early in training, the model only sees pairs of adjacent noise levels that are very similar ($N = 2$ means only two time bins). As training progresses, the bins become finer, forcing the model to handle increasingly different noise levels. This curriculum is crucial — starting with fine bins would produce unstable gradients because the teacher and student would see very different inputs.
+
+### 9.3 Time Discretization
+
+The continuous noise levels are discretized using a power-law schedule:
+
+$$t_i = \left(t_{\min}^{1/\rho} + \frac{i}{N-1}\left(t_{\max}^{1/\rho} - t_{\min}^{1/\rho}\right)\right)^\rho$$
+
+with $\rho = 7$, $t_{\min} = 0.002$, $t_{\max} = 80$.
+
+**Why $\rho = 7$?** This concentrates time steps near $t_{\min}$ where small changes in noise level cause the largest changes in signal quality. The power-law spacing means the model allocates more "resolution" to the near-clean regime (where precise denoising matters most) and less to the high-noise regime (where the input is mostly noise anyway).
+
+```
+Time step distribution (N=150, ρ=7):
+
+    t_max=80 ─  ●
+                │
+                │ Very sparse
+                │ (noise dominates;
+                │  less precision needed)
+                │
+           40 ─ ●
+                │
+                │
+           20 ─ ●
+                │
+           10 ─ ●
+                │
+            5 ─ ●●
+                ●●
+            2 ─ ●●●
+            1 ─ ●●●●●
+          0.5 ─ ●●●●●●●●●
+          0.2 ─ ●●●●●●●●●●●●●●●●●●●●
+    t_min=0.002 ─ ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●
+                  ↑ Dense here (clean → slightly noisy; max precision)
+```
+
+### 9.4 Loss Function
+
+The loss is a combination of **LPIPS** (Learned Perceptual Image Patch Similarity) and **L1**:
+
+$$\mathcal{L} = \text{LPIPS}(\hat{y}_{\text{student}}, \hat{y}_{\text{teacher}}) + \lambda_{\text{L1}} \cdot \|\hat{y}_{\text{student}} - \hat{y}_{\text{teacher}}\|_1$$
+
+where $\lambda_{\text{L1}} = 1.0$.
+
+| Component | Purpose |
+|---|---|
+| **LPIPS** | Measures *perceptual* similarity using features from a pretrained SqueezeNet. Encourages the model to match high-level structure (storm patterns, temperature gradients) rather than pixel-exact values. The inputs are bilinearly upsampled to 224×224 before computing LPIPS. |
+| **L1** | Provides a direct pixel-level signal that prevents the model from drifting in absolute values. L1 is preferred over L2 because it is less sensitive to outliers (important for precipitation, which has a heavy-tailed distribution). |
+
+### 9.5 EMA Teacher Update
+
+After each gradient step, the teacher's weights are updated:
+
+$$\theta_{\text{teacher}} \leftarrow \mu \cdot \theta_{\text{teacher}} + (1 - \mu) \cdot \theta_{\text{student}}$$
+
+The EMA decay rate $\mu$ is tied to the current number of bins:
+
+$$\mu = \exp\left(\frac{N_{\min} \cdot \ln(\mu_0)}{N(k)}\right)$$
+
+where $\mu_0 = 0.9$. Early in training (small $N$), $\mu$ is small (teacher tracks student closely). As $N$ grows, $\mu \to 1$ (teacher becomes more conservative), stabilizing training.
+
+### 9.6 Training Configuration
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| Optimizer | RAdam | Adam with rectified variance — more stable than Adam in early training |
+| Learning rate | $2 \times 10^{-4}$ | Standard for diffusion model U-Nets |
+| Gradient clipping | 1.0 (norm) | Prevents explosion during early-stage large-$N$ transitions |
+| Batch size | 1 | Limited by GPU memory (176×360 grid, 14.5M params, H100 GPU) |
+| Epochs | 100 | ~612,000 gradient steps (6,120 samples × 100 epochs) |
+| Seed | 42 | Reproducibility |
+| Data std $\sigma_{\text{data}}$ | 0.5 | Scaling factor for the skip/output coefficients |
+| Output clipping | $[-1, 1]$ | Ensures bounded outputs — the spherical backbone lacks the implicit bounding of GroupNorm + residual connections that the UNet2D achieves |
+
+---
+
+## 10. Sampling: Generating New Climate Fields
+
+### 10.1 Single-Step Sampling
+
+```python
+# Generate a batch of climate fields in ONE forward pass:
+z = torch.randn(B, 3, 176, 360) * t_max      # Pure noise, scaled by σ_max=80
+x_hat = model._forward(model.model_ema, z, t_max)    # Denoise in one step
+```
+
+The model maps pure noise directly to a climate field. The consistency property ensures that this single-step prediction is coherent because the model has learned to map every point on a noise trajectory to the same clean output.
+
+### 10.2 Multi-Step Sampling (Optional Refinement)
+
+For higher-quality samples, the model can perform iterative refinement:
+
+```
+Step 1: z ~ N(0, σ²_max · I)
+        x̂₁ = f_θ(z, t_max)                          ← first denoising
+
+Step 2: x̂₁_noisy = x̂₁ + √(t₂² - t²_min) · ε₂      ← add noise back
+        x̂₂ = f_θ(x̂₁_noisy, t₂)                     ← second denoising
+
+Step 3: x̂₂_noisy = x̂₂ + √(t₃² - t²_min) · ε₃      ← add noise back
+        x̂₃ = f_θ(x̂₂_noisy, t₃)                     ← third denoising
+        ...
+```
+
+Each iteration adds a small amount of noise and re-denoises, allowing the model to refine details. In practice, 1–3 steps suffice for climate fields.
+
+---
+
+## 11. Design Decisions and Lessons Learned
+
+### 11.1 Why Not Use Standard Circular Padding Everywhere?
+
+While `UpsampleConv2d` uses `padding_mode="circular"` (solving the East-West boundary), it does not handle the poles. DirectNeighConv handles *both* boundaries in a unified way through its precomputed neighbour indices. The two approaches are complementary:
+
+- **DirectNeighConv**: Used for all feature-processing convolutions (handles poles + longitude wrapping)
+- **UpsampleConv2d**: Used only for post-upsampling smoothing (handles longitude wrapping; pole corrections come from subsequent DirectNeighConv layers)
+
+### 11.2 Why GroupNorm Instead of BatchNorm?
+
+BatchNorm maintains running statistics that diverge between train and eval mode. In consistency models, the EMA teacher runs in eval mode while the student runs in train mode. If the normalization layers behave differently, the teacher-student consistency is broken, and training degrades. GroupNorm has no running statistics — it normalizes within each sample — so train/eval behaviour is identical.
+
+This was discovered empirically: early versions using BatchNorm showed a persistent train/val gap that disappeared when switching to GroupNorm.
+
+### 11.3 Why 9 Neighbours (Not 4 or 6)?
+
+The 8-connected neighbourhood (plus self) matches a 3×3 convolution kernel. With 4-connectivity (von Neumann neighbourhood), diagonal features cannot be captured. With 6-connectivity (hexagonal), the grid would need to be triangular or hexagonal. The 8-connected scheme:
+- Matches the expressiveness of standard 2D CNNs (important for fair comparison)
+- Works naturally on equiangular grids
+- Provides 9 independent directional weights per filter
+- Proven effective in the vast majority of computer vision architectures
+
+### 11.4 Why Auto-Crop Latitude from 180 to 176?
+
+The U-Net with depth 4 halves spatial dimensions 3 times: $H \to H/2 \to H/4 \to H/8$. For this to produce integer dimensions at every level, $H$ must be divisible by $2^{4-1} = 8$. Since $180 / 8 = 22.5$ (not integer), we symmetrically crop 4 rows (2 from the north pole, 2 from the south pole) to get $176 / 8 = 22$. The cropped rows are at the extreme poles where data quality is lowest anyway.
+
+### 11.5 Evolution from Spectral to Spatial Convolutions
+
+The architecture evolved through six versions:
+
+| Version | Convolution | Upsampling | Key Issue |
+|---|---|---|---|
+| v1-v2 | ChebConv (K=3) | Nearest-neighbour | Severe blocky artefacts |
+| v3 | ChebConv (K=3) | Nearest-neighbour | ResNet blocks helped, still blocky |
+| v4 | ChebConv (K=3) | Nearest + ChebConv smooth | ChebConv too isotropic to smooth |
+| v5 | ChebConv (K=3) | **Bilinear + Conv2d smooth** | Upsampling fixed, conv still isotropic |
+| **v6** | **DirectNeighConv** | Bilinear + Conv2d smooth | **Full anisotropy throughout** |
+
+The critical insight was that isotropic spectral filters ($T_0 = I$) provide a trivial identity shortcut that lets blocky artefacts propagate uncorrected. Quantitative analysis confirmed: the Laplacian of v3/v4 outputs was 2.5× higher than ERA5 reference data, and the even-odd gradient ratio (a measure of blockiness) was 0.48 (v3) vs 1.00 (ERA5). Bilinear upsampling (v5) improved the even-odd ratio to 0.95, and DirectNeighConv (v6) eliminated the isotropy bottleneck in the feature-processing path.
+
+---
+
+## 12. Summary of Hyperparameters
+
+### Model Architecture
+
+| Parameter | Value |
+|---|---|
+| Input/Output channels | 3 (pr, t2m, tcc) |
+| Grid dimensions | 176 × 360 (lat × lon, auto-cropped from 180) |
+| U-Net depth | 4 levels |
+| Channel widths | [128, 128, 256, 256] |
+| Blocks per level | 2 (encoder) + 2 (decoder) |
+| Time embedding dim | 64 |
+| Convolution type | DirectNeighConv (9-tap spatial gather) |
+| Normalization | GroupNorm (32 groups or largest divisor) |
+| Activation | SiLU |
+| Mid-block attention | Full self-attention, 1 head |
+| Upsampling | Bilinear 2× + Conv2d(3×3, circular) smooth |
+| Downsampling | 2×2 average pooling |
+| **Total parameters** | **14,485,193** |
+
+### Training
+
+| Parameter | Value |
+|---|---|
+| Dataset | ERA5 reanalysis, 1° resolution |
+| Training samples | 6,120 (daily fields, ~17 years) |
+| Validation samples | 1,560 (~4.3 years) |
+| Batch size | 1 |
+| Optimizer | RAdam, lr = 2×10⁻⁴ |
+| Gradient clipping | Norm = 1.0 |
+| Epochs | 100 |
+| Bins schedule | $N_{\min}=2 \to N_{\max}=150$ (sqrt schedule) |
+| Loss | LPIPS (SqueezeNet) + L1 |
+| EMA initial decay | 0.9 |
+| $\sigma_{\text{data}}$ | 0.5 |
+| $t_{\min}$, $t_{\max}$ | 0.002, 80 |
+| Time discretization $\rho$ | 7 |
+| Output clipping | [-1, 1] |
+
+### Compute
+
+| Resource | Details |
+|---|---|
+| GPU | NVIDIA H100 (80 GB) |
+| Training time | ~100 epochs × ~12 min/epoch ≈ 20 hours |
+| SLURM setup | Array job [0-19], 4h per task, 1 GPU, 16 CPUs, 64 GB RAM |
+| Framework | PyTorch 2.5.1, PyTorch Lightning |
+
+---
+
+## References
+
+- Song, Y., Dhariwal, P., Chen, M., & Sutskever, I. (2023). *Consistency Models*. ICML.
+- Defferrard, M., Milani, M., Gusset, F., & Perraudin, N. (2020). *DeepSphere: a graph-based spherical CNN*. ICLR.
+- Zhao, F., et al. (2019). *Spherical U-Net on Unstructured Meshes*. arXiv:1904.00906.
+- Ho, J., Jain, A., & Abbeel, P. (2020). *Denoising Diffusion Probabilistic Models*. NeurIPS.
+- Ronneberger, O., Fischer, P., & Brox, T. (2015). *U-Net: Convolutional Networks for Biomedical Image Segmentation*. MICCAI.
