@@ -1,6 +1,10 @@
 # Spherical Consistency Downscaling
 
+
+
 Statistical downscaling of global climate fields using a spherical graph consistency model. The model learns to stochastically map coarse-resolution ESM output (∼4°) to high-resolution ERA5 fields (1°) for precipitation, temperature, and total cloud cover simultaneously.
+
+<img src="figures/downscaling_comparison.gif" alt="Coarse Reconstruction" width="50%">
 
 ## Method
 
