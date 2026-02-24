@@ -19,7 +19,7 @@ class QuantileMapping():
                  test_set: Optional[Tuple[str,str]]=['2020', '2100'],
                  verbose: Optional[bool]=True
                  ):
-        """Peforms quantile mapping on model data given a target dataset.
+        """Performs quantile mapping on model data given a target dataset.
 
         Args:
             model_path: Path to simlulatin data in .nc format.
@@ -80,7 +80,7 @@ class QuantileMapping():
 
 
     def run(self):
-        """Peforms the quantile mapping. """
+        """Performs the quantile mapping. """
         
         if self.verbose: print('fitting quantiles..')
         group = sdba.adjustment.Grouper("time")

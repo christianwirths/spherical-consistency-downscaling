@@ -96,10 +96,10 @@ class TrainingConfig:
 
 @dataclass
 class DiffusionConfig:
-    """ Contains the diffusion configuration:
-        - UNet architechture: number of channels, up and down blocks
+    """ Contains the generative model configuration:
+        - UNet architecture: number of channels, up and down blocks
         - variance schedule parameters
-        - eponential moving average (EMA) decay
+        - exponential moving average (EMA) decay
     """
 
     name: str ='test_model_v1'
@@ -133,7 +133,7 @@ class DiffusionConfig:
     use_ema: bool = False
 
     # ----- Backbone selection -----
-    # 'unet2d' (default diffusers UNet2DModel) or 'spherical' (DeepSphere graph U-Net)
+    # 'unet2d' (default diffusers UNet2DModel) or 'spherical' (spherical graph U-Net)
     backbone_type: str = 'unet2d'
 
     # ----- Spherical U-Net specific -----

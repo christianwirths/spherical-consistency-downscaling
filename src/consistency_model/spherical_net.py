@@ -90,7 +90,8 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Graph Laplacian utilities (vendored from DeepSphere to avoid hard dep)
+# [Legacy] Graph Laplacian utilities (vendored from DeepSphere, retained for
+# reference — not used by the current DirectNeighConv backbone)
 # ---------------------------------------------------------------------------
 
 def _scipy_csr_to_sparse_tensor(csr_mat):
@@ -322,7 +323,8 @@ def build_equiangular_graph(n_lat: int, n_lon: int, depth: int):
 
 
 # ---------------------------------------------------------------------------
-# Chebyshev graph convolution (vendored & simplified from DeepSphere)
+# [Legacy] Chebyshev graph convolution (vendored & simplified from DeepSphere,
+# retained for reference — superseded by DirectNeighConv)
 # ---------------------------------------------------------------------------
 
 def _cheb_conv(laplacian, x, weight):

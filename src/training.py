@@ -26,7 +26,7 @@ def training(config: Config,
 
     Args:
         config: Configuration containing hyperparameters and file paths
-        model: The diffusion model to be trained
+        model: The generative model to be trained
         verbose: Prints the trainig configuration
         resume_ckpt_path: Resumes training from a saved model checkpoint if provided.
     """
@@ -79,7 +79,7 @@ def training(config: Config,
                                   n_workers=config.n_workers,
                                   use_mnist=config.use_mnist)
 
-    # Train the diffusion model
+    # Train the generative model
     trainer.fit(model,
                 train_dataloaders=dataloaders['train'],
                 val_dataloaders=dataloaders['val'],

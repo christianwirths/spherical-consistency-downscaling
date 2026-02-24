@@ -1,5 +1,5 @@
 """
-Spherical sampling script for the DeepSphere-based consistency model.
+Spherical sampling script for the spherical graph consistency model.
 
 This script loads a trained spherical consistency model checkpoint and
 generates samples either unconditionally or conditionally (stroke-guidance).
