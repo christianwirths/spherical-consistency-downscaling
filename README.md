@@ -2,7 +2,7 @@
 
 
 
-Statistical downscaling of global climate fields using a spherical graph consistency model. The model learns to stochastically map coarse-resolution ESM output (∼4°) to high-resolution ERA5 fields (1°) for precipitation, temperature, and total cloud cover simultaneously.
+Downscaling of global climate fields using a spherical graph consistency model. The model learns to stochastically map coarse-resolution ESM output (∼4°) to high-resolution ERA5 fields (1°) for precipitation, temperature, and total cloud cover simultaneously. To represent Earth's spherical structure, we utilize a spherical graph neural network backbone operating natively on the $S^2$ manifold. This approach avoids polar singularities and edge distortions inherent to standard latitude-longitude projections.
 
 <img src="figures/downscaling_comparison.gif" alt="Coarse Reconstruction" width="100%">
 
