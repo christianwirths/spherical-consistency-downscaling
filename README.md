@@ -30,6 +30,14 @@ python spherical_sampling.py \
 
 Data (ERA5, checkpoints) are not included and must be placed in `data/`.
 
+## Tests
+
+Run unit tests with 
+
+```bash
+python -m unittest discover tests/
+```
+
 ## References
 
 - P. Hess et al. (2025), Consistent and physically based climate downscaling — https://www.nature.com/articles/s42256-025-00980-5

@@ -7,9 +7,9 @@ logic continues to operate on [B, C, H, W] tensors — the grid-to-graph and
 graph-to-grid conversions happen entirely inside this module.
 
 Architecture (structurally matches diffusers UNet2DModel):
-  - **Encoder**: 2 × GraphResNetBlock per level (matches layers_per_block=2).
+  - **Encoder**: 2 x GraphResNetBlock per level (matches layers_per_block=2).
   - **Mid-block**: GraphResNetBlock → GraphSelfAttention → GraphResNetBlock.
-  - **Decoder**: 2 × GraphResNetBlock per level with skip connections.
+  - **Decoder**: 2 x GraphResNetBlock per level with skip connections.
   - **Time conditioning**: Additive projection after first conv in each
     ResNet block (matches diffusers ``"default"`` time_embedding_norm).
   - **Normalization**: GroupNorm everywhere (train/eval invariant).
@@ -18,7 +18,7 @@ Architecture (structurally matches diffusers UNet2DModel):
 
 Convolution operator — **DirectNeighConv** (v6):
   Uses a direct 9-tap spatial gather (self + 8 surrounding vertices) with
-  ``nn.Linear(9 * F_in, F_out)``, analogous to a 3×3 Conv2d but with proper
+  ``nn.Linear(9 * F_in, F_out)``, analogous to a 3x3 Conv2d but with proper
   spherical topology:
     - **Longitude**: circular wrapping (East ↔ West boundary stitched).
     - **Poles**: reflection with 180° longitude shift (crossing the pole
@@ -29,7 +29,7 @@ Convolution operator — **DirectNeighConv** (v6):
 
 Key design decisions:
   1. DirectNeighConv operates on a precomputed ``neigh_orders`` index array,
-     making convolution equivalent to a 3×3 Conv2d on the equiangular grid
+     making convolution equivalent to a 3x3 Conv2d on the equiangular grid
      but with correct spherical boundary handling.
   2. Neighbour indices are precomputed once at __init__ time and registered
      as buffers so they live on the correct device automatically.
@@ -130,7 +130,7 @@ def build_equiangular_laplacians(n_lat: int, n_lon: int, depth: int,
     resolutions (one per U-Net level).
 
     Uses PyGSP's ``SphereEquiangular`` graph.  Each pooling step halves
-    both spatial dimensions via 2×2 average pooling.
+    both spatial dimensions via 2x2 average pooling.
 
     Requires the DeepSphere fork of PyGSP::
 
@@ -226,7 +226,7 @@ def build_equiangular_neighbours(H: int, W: int) -> np.ndarray:
     Boundary handling:
       - **Longitude** (j axis): circular wrapping — the East and West
         boundaries are stitched together.
-      - **Latitude poles** (i = 0 or i = H−1): reflection across the pole
+      - **Latitude poles** (i = 0 or i = H-1): reflection across the pole
         with a 180° longitude shift.  Crossing the pole maps (i, j) to
         (i, (j + W//2) % W) and reverses the East/West sense, so NE at
         the original point becomes NW at the reflected point and vice versa.
@@ -289,7 +289,7 @@ def build_equiangular_graph(n_lat: int, n_lon: int, depth: int):
     """Build neighbour-order arrays and grid dimensions for an equiangular
     grid at multiple resolutions (one per U-Net level).
 
-    Each pooling step halves both spatial dimensions via 2×2 average pooling.
+    Each pooling step halves both spatial dimensions via 2x2 average pooling.
 
     Args:
         n_lat: Number of latitude points (must be divisible by 2^(depth-1)).
@@ -305,7 +305,7 @@ def build_equiangular_graph(n_lat: int, n_lon: int, depth: int):
     factor = 2 ** (depth - 1)
     if n_lat % factor != 0 or n_lon % factor != 0:
         raise ValueError(
-            f"Grid {n_lat}×{n_lon} is not divisible by 2^(depth-1) = {factor}. "
+            f"Grid {n_lat}x{n_lon} is not divisible by 2^(depth-1) = {factor}. "
             f"Either reduce spherical_depth or adjust the grid dimensions."
         )
 
@@ -395,7 +395,7 @@ class DirectNeighConv(nn.Module):
     """Direct 9-tap spatial neighbourhood convolution on equiangular grid.
 
     Gathers 9 neighbours (self + 8 surrounding) per vertex and applies a
-    learned linear transform, analogous to a 3×3 Conv2d but with proper
+    learned linear transform, analogous to a 3x3 Conv2d but with proper
     spherical topology (circular longitude wrapping, pole reflection).
 
     Each of the 9 spatial positions has independent weights → **anisotropic**.
@@ -477,7 +477,7 @@ class GraphResNetBlock(nn.Module):
     Forward path:
         GN → SiLU → DirectNeighConv → time_proj(t) additive → GN → SiLU → DirectNeighConv
     Residual path:
-        x  → (optional 1×1 shortcut if in_ch ≠ out_ch) → add to main path
+        x  → (optional 1x1 shortcut if in_ch != out_ch) → add to main path
 
     This exactly mirrors the ``ResnetBlock2D`` from diffusers:
       - Pre-norm (GroupNorm before convolution)
@@ -552,7 +552,7 @@ class GraphSelfAttention(nn.Module):
       GN → Q,K,V linear projections → scaled dot-product attention →
       output projection → residual add.
 
-    At the coarsest level (22×45 = 990 vertices) full self-attention is
+    At the coarsest level (22x45 = 990 vertices) full self-attention is
     computationally cheap.
 
     Args:
@@ -606,10 +606,10 @@ class GraphSelfAttention(nn.Module):
 class AvgPool2dGraph(nn.Module):
     """2-D spatial average pooling for equiangular graph signals.
 
-    Reshapes [B, V, F] → [B, F, H, W], applies 2×2 average pooling,
+    Reshapes [B, V, F] → [B, F, H, W], applies 2x2 average pooling,
     and re-flattens to [B, V/4, F].  This is the correct pooling for
     equiangular grids where the vertex ordering is row-major
-    (lat × lon).  HEALPix grids would need 1-D pooling instead.
+    (lat x lon).  HEALPix grids would need 1-D pooling instead.
     """
 
     def __init__(self, h: int, w: int):
@@ -630,10 +630,10 @@ class AvgPool2dGraph(nn.Module):
 class AvgUnpool2dGraph(nn.Module):
     """2-D spatial upsampling for equiangular graph signals.
 
-    Reshapes [B, V, F] → [B, F, H, W], applies 2× bilinear interpolation
+    Reshapes [B, V, F] → [B, F, H, W], applies 2x bilinear interpolation
     in both spatial dimensions, and re-flattens to [B, V*4, F].
 
-    Uses bilinear mode instead of nearest-neighbour to avoid 2×2 block
+    Uses bilinear mode instead of nearest-neighbour to avoid 2x2 block
     artefacts that Chebyshev graph convolutions cannot smooth
     (isotropic filters lack direction-specific kernels).
     """
@@ -657,7 +657,7 @@ class UpsampleConv2d(nn.Module):
     """Post-upsample Conv2d smoothing for graph signals.
 
     Operates in the 2-D image domain: reshapes [B, V, C] → [B, C, H, W],
-    applies a 3×3 Conv2d with GroupNorm + SiLU, then reshapes back.
+    applies a 3x3 Conv2d with GroupNorm + SiLU, then reshapes back.
 
     This replaces the isotropic ChebConv (SphericalChebBN) that was unable
     to smooth nearest-neighbour / bilinear artefacts.  Conv2d has 9
@@ -769,9 +769,9 @@ class SphericalDecoder(nn.Module):
     """Configurable decoder with 2 ResNet blocks per level + skip connections.
 
     Mirrors the 2D UNet ``UpBlock2D``: bilinear-unpool → Conv2d smooth →
-    concat with skip → 2 × GraphResNetBlock.
+    concat with skip → 2 x GraphResNetBlock.
 
-    Post-upsample smoothing uses ``UpsampleConv2d`` (3×3 Conv2d with circular
+    Post-upsample smoothing uses ``UpsampleConv2d`` (3x3 Conv2d with circular
     padding) for direction-specific smoothing after bilinear interpolation.
 
     Args:
@@ -927,7 +927,7 @@ class SphericalUNetWrapper(nn.Module):
     returns a ``SphericalUNetOutput`` whose ``.sample`` field is also
     ``[B, C, H, W]``.  Internally it:
 
-    1. Reshapes ``[B, C, H, W]`` → ``[B, V, C]``  (V = H × W).
+    1. Reshapes ``[B, C, H, W]`` → ``[B, V, C]``  (V = H x W).
     2. Computes a sinusoidal time embedding and passes it to the graph
        U-Net where it is injected at every encoder/decoder level via
        FiLM (Feature-wise Linear Modulation).
