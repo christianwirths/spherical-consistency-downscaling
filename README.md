@@ -40,6 +40,8 @@ python -m unittest discover tests/
 
 ## References
 
+- This implementation builds on the repository: https://github.com/p-hss/consistency-climate-downscaling 
+
 - P. Hess et al. (2025), Consistent and physically based climate downscaling — https://www.nature.com/articles/s42256-025-00980-5
 - Y. Song et al. (2023), Consistency Models — https://arxiv.org/abs/2303.01469
 - Y. Song et al. (2021), Score-based generative models — https://arxiv.org/abs/2011.13456
